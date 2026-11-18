@@ -86,3 +86,35 @@ O e-mail informado é enviado como contato às APIs do Unpaywall e do OpenAlex. 
 ## Limites de acesso
 
 O script baixa apenas PDFs identificados como acesso aberto. Ele não tenta acessar conteúdo pago, contornar paywalls ou usar autenticações de editoras. A disponibilidade varia conforme o DOI e as fontes abertas registradas.
+
+## Artigos que não baixaram (IEEE, Springer, ACM...)
+
+Essas editoras não oferecem API para baixar artigos assinados, e a ACM bloqueia downloads por script. O caminho é baixar com o **seu acesso institucional** (CAPES/CAFe, VPN, proxy da biblioteca) e depois importar os PDFs. O script `pendentes.py` ajuda nas duas pontas.
+
+### 1. Gerar a lista dos pendentes
+
+```powershell
+nome_do_ambiente\Scripts\python.exe pendentes.py lista
+```
+
+Lê o `artigos_baixados/results.csv` e cria:
+
+- `artigos_baixados/pendentes.txt`: um DOI por linha, para colar no Zotero ("Adicionar item por identificador", ícone da varinha). Depois selecione os itens, clique com o botão direito e escolha "Encontrar PDF disponível".
+- `artigos_baixados/pendentes.html`: links agrupados por editora, com um botão para copiar os DOIs de cada grupo. Os artigos sem DOI trazem link de busca no Google Acadêmico.
+
+### 2. Importar os PDFs baixados manualmente
+
+Coloque os PDFs numa pasta qualquer, com qualquer nome de arquivo. Pode ser a pasta `storage` do Zotero, que tem subpastas. Rode:
+
+```powershell
+nome_do_ambiente\Scripts\python.exe pendentes.py importar "C:\caminho\da\pasta" --dry-run   # só mostra
+nome_do_ambiente\Scripts\python.exe pendentes.py importar "C:\caminho\da\pasta"             # move de fato
+```
+
+Para cada PDF, o script identifica o artigo da lista nesta ordem:
+
+1. pelo DOI escrito no próprio PDF;
+2. pelo DOI no nome do arquivo;
+3. pelo título do artigo na primeira página.
+
+Os PDFs identificados são renomeados para `Titulo_DOI.pdf`, movidos para `artigos_baixados` e marcados como baixados no `results.csv`. Os pendentes são então regenerados. PDFs não identificados, ou que já existem na pasta, ficam onde estavam. Na próxima execução do `doi_to_drive.py`, os artigos importados aparecem como "já baixado".
