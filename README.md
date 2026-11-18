@@ -29,7 +29,7 @@ No macOS ou Linux, use um caminho local como `~/Documents/Artigos`. Se não houv
 
 ## Relatório (`results.csv`)
 
-Cada linha traz `title`, `doi`, `status` (`ok` ou `failed`), `reason`, `file` (nome do PDF na pasta), `source` (fonte que achou o PDF), `source_url` e `message` (detalhe do erro). Valores de `reason`:
+Cada linha traz `title`, `doi`, `doi_found` (DOI descoberto pelo título), `status` (`ok` ou `failed`), `reason`, `file` (nome do PDF na pasta), `source` (fonte que achou o PDF), `source_url` e `message` (detalhe do erro). Valores de `reason`:
 
 | reason | significado |
 |---|---|
@@ -54,7 +54,28 @@ Para cada DOI, as fontes são consultadas nesta ordem, parando no primeiro PDF v
 
 Quando um link aponta para a página do artigo, e não para o PDF, o script tenta o link indicado na meta tag `citation_pdf_url` da página. Para mudar ou limitar as fontes, use `--sources openalex,semanticscholar`. Chaves de API são opcionais e ajudam com limites de requisições: `S2_API_KEY` (Semantic Scholar) e `OPENALEX_API_KEY`, definidas como variáveis de ambiente.
 
-Nenhuma dessas fontes pesquisa Scopus ou outras bases pagas. Alguns sites (MDPI, Wiley, ACM) bloqueiam downloads automáticos com erro 403, mesmo de artigos abertos. Nesses casos, abra no navegador um dos links listados na coluna `message`.
+### Elsevier (artigos assinados pela sua instituição)
+
+Artigos da Elsevier (DOI `10.1016/...`) podem ser baixados pela API do ScienceDirect, mesmo sem ser acesso aberto, quando sua instituição assina o periódico (por exemplo, pelo Portal de Periódicos CAPES). A política de mineração de texto da Elsevier permite esse uso para pesquisa não comercial.
+
+1. Crie uma chave gratuita em https://dev.elsevier.com ("I want an API key").
+2. Rode o script **na rede da universidade ou conectada à VPN dela**. Fora dessa rede, peça à biblioteca um *insttoken* da Elsevier.
+3. Defina a chave e rode normalmente. A fonte `elsevier` é ativada automaticamente:
+
+   ```powershell
+   $env:ELSEVIER_API_KEY = "sua-chave"
+   # opcional, fora da rede da universidade:
+   $env:ELSEVIER_INSTTOKEN = "seu-insttoken"
+   nome_do_ambiente\Scripts\python.exe doi_to_drive.py --input articles.csv --email seu-email@...
+   ```
+
+Antes de baixar, o script verifica se você tem acesso ao artigo. Sem acesso, o relatório mostra "Elsevier: sem acesso institucional". Um erro HTTP 401 ou 403 indica chave inválida ou que você está fora da rede ou VPN da instituição.
+
+### Artigos sem DOI
+
+Quando o DOI está vazio ou inválido, o script procura o DOI pelo título no OpenAlex e no Crossref. Ele só aceita um resultado quando o título encontrado é praticamente idêntico ao da lista (semelhança de pelo menos 93%). O DOI encontrado aparece na coluna `doi_found` do relatório. Muitos trabalhos de conferência simplesmente não têm DOI e continuam como `invalid_doi`. Para desligar essa busca, use `--no-doi-lookup`.
+
+Nenhuma dessas fontes pesquisa Scopus ou outras bases pagas. O Scopus não guarda PDFs, mas o CSV exportado por ele (colunas `Title`, `Abstract`, `DOI`) pode ser usado diretamente em `--input`. Alguns sites (MDPI, Wiley, ACM) bloqueiam downloads automáticos com erro 403, mesmo de artigos abertos. Nesses casos, abra no navegador um dos links listados na coluna `message`.
 
 ## Não baixar de novo
 

@@ -2,18 +2,22 @@
 """Find open-access article PDFs by DOI and save them on this computer.
 
 Sources (queried in order, stopping at the first valid PDF): Unpaywall, OpenAlex,
-Semantic Scholar (including arXiv copies). Only open-access versions are downloaded.
+Semantic Scholar (including arXiv copies) and, when ELSEVIER_API_KEY is set, the Elsevier
+ScienceDirect API for articles your institution subscribes to. Missing DOIs are looked up
+by title (OpenAlex, Crossref).
 This tool does not bypass publisher paywalls or authentication.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import html
 import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urljoin
@@ -23,10 +27,17 @@ import requests
 UNPAYWALL_URL = "https://api.unpaywall.org/v2/{doi}"
 OPENALEX_URL = "https://api.openalex.org/works/doi:{doi}"
 S2_URL = "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
-ALL_SOURCES = ["unpaywall", "openalex", "semanticscholar"]
-SOURCE_LABELS = {"unpaywall": "Unpaywall", "openalex": "OpenAlex", "semanticscholar": "Semantic Scholar"}
+ELSEVIER_ENTITLEMENT_URL = "https://api.elsevier.com/content/article/entitlement/doi/{doi}"
+ELSEVIER_ARTICLE_URL = "https://api.elsevier.com/content/article/doi/{doi}"
+OPENALEX_SEARCH_URL = "https://api.openalex.org/works"
+CROSSREF_SEARCH_URL = "https://api.crossref.org/works"
+ALL_SOURCES = ["unpaywall", "openalex", "semanticscholar", "elsevier"]
+SOURCE_LABELS = {
+    "unpaywall": "Unpaywall", "openalex": "OpenAlex", "semanticscholar": "Semantic Scholar", "elsevier": "Elsevier",
+}
+TITLE_MATCH_THRESHOLD = 0.93  # semelhança mínima entre títulos para aceitar um DOI encontrado
 USER_AGENT = "doi-article-downloader/1.0 (open-access article downloader)"
-REPORT_FIELDS = ["title", "doi", "status", "reason", "file", "source", "source_url", "message"]
+REPORT_FIELDS = ["title", "doi", "doi_found", "status", "reason", "file", "source", "source_url", "message"]
 
 # Motivos (coluna "reason") usados no relatório.
 REASON_LABELS = {
@@ -36,7 +47,7 @@ REASON_LABELS = {
     "duplicate": "DOI repetido na lista",
     "not_found": "DOI não encontrado em nenhuma fonte",
     "not_open_access": "Sem versão de acesso aberto em nenhuma fonte",
-    "download_failed": "Versão aberta existe, mas o PDF não pôde ser baixado",
+    "download_failed": "Versão encontrada, mas o PDF não pôde ser baixado",
     "api_error": "Erro ao consultar as fontes",
     "error": "Erro inesperado",
 }
@@ -173,11 +184,49 @@ def urls_from_semanticscholar(doi: str, session: requests.Session, args: argpars
     return urls
 
 
+def elsevier_headers() -> dict[str, str]:
+    headers = {"X-ELS-APIKey": os.environ.get("ELSEVIER_API_KEY", "")}
+    if os.environ.get("ELSEVIER_INSTTOKEN"):
+        headers["X-ELS-Insttoken"] = os.environ["ELSEVIER_INSTTOKEN"]
+    return headers
+
+
+def urls_from_elsevier(doi: str, session: requests.Session, args: argparse.Namespace) -> list[str]:
+    """Elsevier ScienceDirect: only for 10.1016 DOIs the institution is entitled to."""
+    if not doi.lower().startswith("10.1016/"):
+        raise SourceLookup("skip", "")
+    try:
+        data = _get_json(
+            session, "Elsevier", ELSEVIER_ENTITLEMENT_URL.format(doi=quote(doi, safe="/")),
+            headers={**elsevier_headers(), "Accept": "application/json"},
+        )
+    except SourceLookup as exc:
+        if exc.kind == "api_error":
+            raise SourceLookup(
+                "api_error", f"{exc} (verifique ELSEVIER_API_KEY e se está na rede/VPN da instituição)"
+            ) from exc
+        raise
+    entitlement = (data.get("entitlement-response") or {}).get("document-entitlement") or {}
+    if isinstance(entitlement, list):
+        entitlement = entitlement[0] if entitlement else {}
+    if str(entitlement.get("entitled", "")).lower() != "true":
+        raise SourceLookup("no_oa", "Elsevier: sem acesso institucional a este artigo (está na rede/VPN da instituição?)")
+    return [ELSEVIER_ARTICLE_URL.format(doi=quote(doi, safe="/"))]
+
+
 SOURCE_FUNCS = {
     "unpaywall": urls_from_unpaywall,
     "openalex": urls_from_openalex,
     "semanticscholar": urls_from_semanticscholar,
+    "elsevier": urls_from_elsevier,
 }
+# Cabeçalhos extras usados ao baixar o PDF de cada fonte.
+SOURCE_DOWNLOAD_HEADERS = {"elsevier": lambda: {**elsevier_headers(), "Accept": "application/pdf"}}
+
+
+def pdf_page_count(content: bytes) -> int:
+    """Rough page count (0 when page objects are compressed and can't be counted)."""
+    return len(re.findall(rb"/Type\s*/Page(?![a-zA-Z])", content))
 
 
 CITATION_PDF_RE = re.compile(
@@ -187,8 +236,10 @@ CITATION_PDF_RE = re.compile(
 )
 
 
-def download_pdf(url: str, session: requests.Session, follow_landing: bool = True) -> bytes:
-    candidate = session.get(url, timeout=(10, 45), allow_redirects=True)
+def download_pdf(
+    url: str, session: requests.Session, follow_landing: bool = True, headers: dict[str, str] | None = None
+) -> bytes:
+    candidate = session.get(url, timeout=(10, 45), allow_redirects=True, headers=headers)
     candidate.raise_for_status()
     content = candidate.content
     if b"%PDF-" in content[:1024]:
@@ -218,29 +269,81 @@ def fetch_pdf(doi: str, session: requests.Session, args: argparse.Namespace) -> 
         try:
             urls = SOURCE_FUNCS[source](doi, session, args)
         except SourceLookup as exc:
-            lookup_kinds.append(exc.kind)
-            notes.append(str(exc))
+            if exc.kind != "skip":  # "skip": fonte não se aplica a este DOI
+                lookup_kinds.append(exc.kind)
+                notes.append(str(exc))
             continue
         new_urls = [u for u in urls if u not in tried]
         if not new_urls:
             lookup_kinds.append("no_oa")
             notes.append(f"{label}: nenhuma versão aberta" + (" nova" if urls else ""))
             continue
+        extra_headers = SOURCE_DOWNLOAD_HEADERS[source]() if source in SOURCE_DOWNLOAD_HEADERS else None
         for url in new_urls:
             tried.add(url)
             try:
-                return download_pdf(url, session), url, source
+                content = download_pdf(url, session, follow_landing=extra_headers is None, headers=extra_headers)
+                if source == "elsevier" and pdf_page_count(content) == 1:
+                    raise ValueError("a Elsevier devolveu só a 1ª página (acesso completo negado)")
+                return content, url, source
             except (requests.RequestException, ValueError) as exc:
                 download_errors.append(f"[{label}] {url}: {exc}")
 
     detail = " | ".join(notes + download_errors)
     if download_errors:
-        raise ArticleError("download_failed", "Versões abertas encontradas, mas nenhum PDF válido foi baixado. " + detail)
+        raise ArticleError("download_failed", "Versões encontradas, mas nenhum PDF válido foi baixado. " + detail)
     if "no_oa" in lookup_kinds:
         raise ArticleError("not_open_access", detail)
     if lookup_kinds and all(kind == "not_found" for kind in lookup_kinds):
         raise ArticleError("not_found", detail)
     raise ArticleError("api_error", detail)
+
+
+def normalize_title(title: str) -> str:
+    text = unicodedata.normalize("NFKD", title or "").encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text)).strip()
+
+
+def _best_title_match(title: str, candidates: list[tuple[str, str]]) -> str | None:
+    """candidates: (doi, title). Return the DOI whose title is close enough to ours."""
+    wanted = normalize_title(title)
+    best_doi, best_score = None, 0.0
+    for doi, cand_title in candidates:
+        score = difflib.SequenceMatcher(None, wanted, normalize_title(cand_title)).ratio()
+        if doi and score > best_score:
+            best_doi, best_score = doi, score
+    return best_doi if best_score >= TITLE_MATCH_THRESHOLD else None
+
+
+def find_doi_by_title(title: str, session: requests.Session, args: argparse.Namespace) -> tuple[str, str] | None:
+    """Look up a DOI by exact-ish title on OpenAlex, then Crossref. Returns (doi, source label)."""
+    words = normalize_title(title)
+    if len(words) < 15:  # títulos muito curtos geram falsos positivos
+        return None
+
+    params: dict[str, Any] = {"filter": f"title.search:{words}", "per_page": 5, "select": "doi,title", "mailto": args.email}
+    if os.environ.get("OPENALEX_API_KEY"):
+        params["api_key"] = os.environ["OPENALEX_API_KEY"]
+    try:
+        data = _get_json(session, "OpenAlex", OPENALEX_SEARCH_URL, params=params)
+        found = _best_title_match(title, [(r.get("doi") or "", r.get("title") or "") for r in data.get("results") or []])
+        if found:
+            return normalize_doi(found), "OpenAlex"
+    except (SourceLookup, ArticleError):
+        pass
+
+    try:
+        data = _get_json(
+            session, "Crossref", CROSSREF_SEARCH_URL,
+            params={"query.bibliographic": title, "rows": 5, "select": "DOI,title", "mailto": args.email},
+        )
+        items = (data.get("message") or {}).get("items") or []
+        found = _best_title_match(title, [(i.get("DOI") or "", (i.get("title") or [""])[0]) for i in items])
+        if found:
+            return normalize_doi(found), "Crossref"
+    except (SourceLookup, ArticleError):
+        pass
+    return None
 
 
 def process_csv(args: argparse.Namespace) -> int:
@@ -274,9 +377,22 @@ def process_csv(args: argparse.Namespace) -> int:
             row = {str(k).strip().lower(): (v or "").strip() for k, v in row.items() if k}
             title, doi = row.get("title", ""), row.get("doi", "")
             reason, message, source_url, file_name, source = "error", "", "", "", ""
+            doi_found, note = "", ""
             used_network = False
             try:
-                normalized = normalize_doi(doi)
+                try:
+                    normalized = normalize_doi(doi)
+                except ArticleError:
+                    if not (args.doi_lookup and title):
+                        raise
+                    used_network = True
+                    result = find_doi_by_title(title, session, args)
+                    if not result:
+                        problem = "DOI vazio" if not doi else f"DOI inválido ({doi!r})"
+                        raise ArticleError("invalid_doi", f"{problem} e nenhum DOI correspondente foi encontrado pelo título.")
+                    normalized, finder = result
+                    doi_found = normalized
+                    note = f"DOI encontrado pelo título via {finder}. "
                 doi_key = normalized.lower()
                 if doi_key in seen_dois:
                     raise ArticleError("duplicate", "DOI duplicado na lista; esta ocorrência foi ignorada.")
@@ -300,13 +416,14 @@ def process_csv(args: argparse.Namespace) -> int:
                 reason, message = exc.reason, str(exc)
             except Exception as exc:  # Continue processing the remaining bibliography.
                 reason, message = "error", str(exc)
+            message = note + message
 
             status = "ok" if reason in ("downloaded", "already_downloaded") else "failed"
             counts[reason] = counts.get(reason, 0) + 1
             if source:
                 source_counts[source] = source_counts.get(source, 0) + 1
             writer.writerow({
-                "title": title, "doi": doi, "status": status, "reason": reason,
+                "title": title, "doi": doi, "doi_found": doi_found, "status": status, "reason": reason,
                 "file": file_name, "source": source, "source_url": source_url, "message": message,
             })
             report.flush()
@@ -337,15 +454,25 @@ def main() -> int:
     parser.add_argument("--input", required=True, help="CSV com as colunas title, abstract e doi")
     parser.add_argument("--email", required=True, help="E-mail de contato enviado ao Unpaywall e ao OpenAlex")
     parser.add_argument(
-        "--sources", default=",".join(ALL_SOURCES),
-        help="Fontes em ordem, separadas por vírgula (padrão: unpaywall,openalex,semanticscholar)",
+        "--sources", default=None,
+        help="Fontes em ordem, separadas por vírgula (padrão: unpaywall,openalex,semanticscholar"
+             " e, se ELSEVIER_API_KEY estiver definida, elsevier)",
+    )
+    parser.add_argument(
+        "--no-doi-lookup", dest="doi_lookup", action="store_false",
+        help="Não procurar pelo título o DOI de linhas com DOI vazio ou inválido",
     )
     parser.add_argument("--download-dir", default="artigos_baixados", help="Pasta local para PDFs e relatório")
     parser.add_argument("--delay", type=float, default=1.0, help="Pausa entre artigos em segundos (padrão: 1)")
     args = parser.parse_args()
     if args.delay < 0:
         parser.error("--delay não pode ser negativo")
+    has_elsevier_key = bool(os.environ.get("ELSEVIER_API_KEY"))
+    if args.sources is None:
+        args.sources = ",".join(src for src in ALL_SOURCES if src != "elsevier" or has_elsevier_key)
     args.sources = [src.strip().lower() for src in args.sources.split(",") if src.strip()]
+    if "elsevier" in args.sources and not has_elsevier_key:
+        parser.error("a fonte elsevier exige a variável de ambiente ELSEVIER_API_KEY")
     unknown = [src for src in args.sources if src not in SOURCE_FUNCS]
     if unknown or not args.sources:
         parser.error("fontes inválidas: " + ", ".join(unknown) + f" (use: {', '.join(ALL_SOURCES)})")
